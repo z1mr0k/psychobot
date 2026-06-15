@@ -6,47 +6,39 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    Message, CallbackQuery,
-    FSInputFile, ReplyKeyboardRemove,
-)
+from aiogram.types import Message, CallbackQuery, FSInputFile
 
-from bot.keyboards.admin import vacation_months_keyboard, vacation_days_keyboard
-from database.logic import add_days_off
 from config import ADMINS
 from bot.keyboards.admin import (
     admin_main_keyboard, booking_actions_keyboard,
     edit_booking_keyboard, export_period_keyboard,
     schedule_menu_keyboard, weekdays_keyboard, vacation_keyboard,
+    vacation_months_keyboard, vacation_days_keyboard,
+    exceptions_months_keyboard, MONTHS_RU,
 )
 from bot.services.admin_service import (
     get_bookings_by_date, get_future_bookings, get_booking_by_id,
     shift_booking, extend_booking,
     get_full_template, update_schedule_day,
-    get_exceptions, add_exception, delete_exception, add_vacation,
+    get_exceptions, add_exception, delete_exception,
     export_bookings_to_excel,
 )
-from database.logic import cancel_booking
+from database.logic import cancel_booking, add_days_off, delete_days_off
 
 router = Router()
+
 
 # ─── FSM ─────────────────────────────────────────────────────────────────────
 
 class AdminStates(StatesGroup):
-    # расписание
-    waiting_day_start  = State()
-    waiting_day_end    = State()
-    editing_weekday    = State()
-    # исключение
-    waiting_exc_date   = State()
-    waiting_exc_type   = State()
-    waiting_exc_start  = State()
-    waiting_exc_end    = State()
-    waiting_exc_delete = State()
-    # отпуск (старый текстовый ввод — оставляем для совместимости)
-    waiting_vac_start  = State()
-    waiting_vac_end    = State()
-    # новый мультивыбор отпуска
+    waiting_day_start       = State()
+    waiting_day_end         = State()
+    editing_weekday         = State()
+    waiting_exc_date        = State()
+    waiting_exc_type        = State()
+    waiting_exc_start       = State()
+    waiting_exc_end         = State()
+    waiting_exc_delete      = State()
     selecting_vacation_days = State()
 
 
@@ -56,7 +48,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
 
-# ─── ФОРМАТИРОВАНИЕ ЗАПИСИ ────────────────────────────────────────────────────
+# ─── ФОРМАТИРОВАНИЕ ──────────────────────────────────────────────────────────
 
 def _fmt_booking(b) -> str:
     return (
@@ -66,6 +58,17 @@ def _fmt_booking(b) -> str:
         f"🕒 {b['start_time'][:5]} – {b['end_time'][:5]}\n"
         f"💬 статус: {b['status']}"
     )
+
+
+def _valid_time(s: str) -> bool:
+    try:
+        parts = s.split(":")
+        assert len(parts) == 2
+        h, m = int(parts[0]), int(parts[1])
+        assert 0 <= h <= 23 and 0 <= m <= 59
+        return True
+    except Exception:
+        return False
 
 
 # ─── ВХОД В АДМИНКУ ──────────────────────────────────────────────────────────
@@ -78,7 +81,16 @@ async def admin_enter(message: Message):
     await message.answer("👨‍💼 Админ-панель", reply_markup=admin_main_keyboard())
 
 
-# ─── СЕГОДНЯ ─────────────────────────────────────────────────────────────────
+# Возврат в главное меню из любого inline
+@router.callback_query(F.data == "admin_to_main")
+async def admin_to_main(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer("👨‍💼 Админ-панель", reply_markup=admin_main_keyboard())
+    await callback.answer()
+
+
+# ─── ЗАПИСИ ──────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 Сегодняшние записи")
 async def admin_today(message: Message):
@@ -92,8 +104,6 @@ async def admin_today(message: Message):
         await message.answer(_fmt_booking(b), reply_markup=booking_actions_keyboard(b["id"]))
 
 
-# ─── ЗАВТРА ──────────────────────────────────────────────────────────────────
-
 @router.message(F.text == "📅 Завтра")
 async def admin_tomorrow(message: Message):
     if not is_admin(message.from_user.id):
@@ -105,8 +115,6 @@ async def admin_tomorrow(message: Message):
     for b in bookings:
         await message.answer(_fmt_booking(b), reply_markup=booking_actions_keyboard(b["id"]))
 
-
-# ─── ВСЕ БУДУЩИЕ ─────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📆 Все будущие записи")
 async def admin_future(message: Message):
@@ -120,7 +128,7 @@ async def admin_future(message: Message):
         await message.answer(_fmt_booking(b), reply_markup=booking_actions_keyboard(b["id"]))
 
 
-# ─── РЕДАКТИРОВАНИЕ ──────────────────────────────────────────────────────────
+# ─── РЕДАКТИРОВАНИЕ ЗАПИСИ ───────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("admin_edit:"))
 async def admin_edit(callback: CallbackQuery):
@@ -146,16 +154,13 @@ async def admin_back(callback: CallbackQuery):
     await callback.answer()
 
 
-# ─── СДВИГ ВРЕМЕНИ ───────────────────────────────────────────────────────────
-
 @router.callback_query(F.data.startswith("admin_shift:"))
 async def admin_shift(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
     _, booking_id, delta = callback.data.split(":")
-    booking_id = int(booking_id)
-    delta = int(delta)
+    booking_id, delta = int(booking_id), int(delta)
 
     success, error = shift_booking(booking_id, delta)
     if not success:
@@ -164,24 +169,22 @@ async def admin_shift(callback: CallbackQuery):
 
     b = get_booking_by_id(booking_id)
     await callback.message.edit_text(
-        _fmt_booking(b) + "\n\n✅ Время обновлено. Выберите действие:",
+        _fmt_booking(b) + "\n\n✅ Время обновлено.",
         reply_markup=edit_booking_keyboard(booking_id),
     )
-
-    # Уведомление клиенту
-    await callback.message.bot.send_message(
-        chat_id=b["user_id"],
-        text=(
-            f"📅 Ваша запись была перенесена.\n\n"
-            f"📅 {b['date']}\n"
-            f"🕒 {b['start_time'][:5]} – {b['end_time'][:5]}\n\n"
-            f"Если у вас вопросы — свяжитесь с нами."
-        ),
-    )
+    try:
+        await callback.message.bot.send_message(
+            chat_id=b["user_id"],
+            text=(
+                f"📅 Ваша запись перенесена.\n\n"
+                f"📅 {b['date']}\n"
+                f"🕒 {b['start_time'][:5]} – {b['end_time'][:5]}"
+            ),
+        )
+    except Exception:
+        pass
     await callback.answer()
 
-
-# ─── ПРОДЛЕНИЕ / СОКРАЩЕНИЕ ───────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("admin_extend:"))
 async def admin_extend(callback: CallbackQuery):
@@ -189,8 +192,7 @@ async def admin_extend(callback: CallbackQuery):
         await callback.answer()
         return
     _, booking_id, delta = callback.data.split(":")
-    booking_id = int(booking_id)
-    delta = int(delta)
+    booking_id, delta = int(booking_id), int(delta)
 
     success, error = extend_booking(booking_id, delta)
     if not success:
@@ -199,13 +201,11 @@ async def admin_extend(callback: CallbackQuery):
 
     b = get_booking_by_id(booking_id)
     await callback.message.edit_text(
-        _fmt_booking(b) + "\n\n✅ Длительность обновлена. Выберите действие:",
+        _fmt_booking(b) + "\n\n✅ Длительность обновлена.",
         reply_markup=edit_booking_keyboard(booking_id),
     )
     await callback.answer()
 
-
-# ─── ОТМЕНА ЗАПИСИ АДМИНОМ ───────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("admin_cancel:"))
 async def admin_cancel(callback: CallbackQuery):
@@ -223,21 +223,23 @@ async def admin_cancel(callback: CallbackQuery):
         return
 
     await callback.message.edit_text("✅ Запись отменена.")
-
     if b:
-        await callback.message.bot.send_message(
-            chat_id=b["user_id"],
-            text=(
-                f"❌ Ваша запись отменена.\n\n"
-                f"📅 {b['date']}\n"
-                f"🕒 {b['start_time'][:5]} – {b['end_time'][:5]}\n\n"
-                f"Для новой записи нажмите 📅 Записаться."
-            ),
-        )
+        try:
+            await callback.message.bot.send_message(
+                chat_id=b["user_id"],
+                text=(
+                    f"❌ Ваша запись отменена.\n\n"
+                    f"📅 {b['date']}\n"
+                    f"🕒 {b['start_time'][:5]} – {b['end_time'][:5]}\n\n"
+                    f"Для новой записи нажмите 📅 Записаться."
+                ),
+            )
+        except Exception:
+            pass
     await callback.answer()
 
 
-# ─── ЭКСПОРТ EXCEL ───────────────────────────────────────────────────────────
+# ─── ЭКСПОРТ ─────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📊 Экспорт Excel")
 async def admin_export(message: Message):
@@ -253,7 +255,6 @@ async def admin_export_period(callback: CallbackQuery):
         return
     period = callback.data.split(":")[1]
     await callback.message.edit_text("⏳ Формирую файл...")
-
     try:
         path = export_bookings_to_excel(period)
         await callback.message.bot.send_document(
@@ -263,18 +264,27 @@ async def admin_export_period(callback: CallbackQuery):
         )
         await callback.message.delete()
     except Exception as e:
-        await callback.message.edit_text(f"⚠️ Ошибка экспорта: {e}")
-
+        await callback.message.edit_text(f"⚠️ Ошибка: {e}")
+    await callback.message.answer("👨‍💼 Админ-панель", reply_markup=admin_main_keyboard())
     await callback.answer()
 
 
-# ─── НАСТРОЙКА РАСПИСАНИЯ ────────────────────────────────────────────────────
+# ─── РАСПИСАНИЕ ──────────────────────────────────────────────────────────────
 
 @router.message(F.text == "⚙️ Настройка расписания")
 async def admin_schedule(message: Message):
     if not is_admin(message.from_user.id):
         return
     await message.answer("⚙️ Расписание:", reply_markup=schedule_menu_keyboard())
+
+
+@router.callback_query(F.data == "schedule:back")
+async def admin_schedule_back(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.message.edit_text("⚙️ Расписание:", reply_markup=schedule_menu_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(F.data == "schedule:template")
@@ -289,17 +299,7 @@ async def admin_schedule_template(callback: CallbackQuery):
     )
     await callback.answer()
 
-@router.callback_query(F.data == "schedule:back")
-async def admin_schedule_back(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    await callback.message.edit_text(
-        "⚙️ Расписание:",
-        reply_markup=schedule_menu_keyboard(),
-    )
-    await callback.answer()
-    
+
 @router.callback_query(F.data.startswith("schedule_day:"))
 async def admin_schedule_day(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -312,7 +312,7 @@ async def admin_schedule_day(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         f"📅 {DAYS[weekday]}\n\n"
         f"Введите время начала в формате ЧЧ:ММ\n"
-        f"или напишите <b>выходной</b> чтобы сделать день нерабочим:",
+        f"или напишите <b>выходной</b>:",
     )
     await callback.answer()
 
@@ -330,11 +330,9 @@ async def admin_day_start(message: Message, state: FSMContext):
             reply_markup=weekdays_keyboard(template),
         )
         return
-
     if not _valid_time(text):
         await message.answer("⚠️ Неверный формат. Введите ЧЧ:ММ или 'выходной':")
         return
-
     await state.update_data(day_start=text)
     await state.set_state(AdminStates.waiting_day_end)
     await message.answer("Введите время окончания в формате ЧЧ:ММ:")
@@ -346,7 +344,6 @@ async def admin_day_end(message: Message, state: FSMContext):
     if not _valid_time(text):
         await message.answer("⚠️ Неверный формат. Введите ЧЧ:ММ:")
         return
-
     data = await state.get_data()
     update_schedule_day(
         data["editing_weekday"],
@@ -369,20 +366,53 @@ async def admin_exceptions(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
+    await callback.message.edit_text(
+        "📌 Выберите месяц для просмотра исключений:",
+        reply_markup=exceptions_months_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("exc_month:"))
+async def admin_exc_month(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    _, year, month = callback.data.split(":")
+    year, month = int(year), int(month)
+
     exceptions = get_exceptions()
-    if exceptions:
+    # фильтруем только выбранный месяц
+    filtered = [
+        e for e in exceptions
+        if e["date"].startswith(f"{year}-{month:02d}")
+    ]
+
+    if filtered:
         lines = []
-        for e in exceptions:
+        for e in filtered:
             if e["is_day_off"]:
                 lines.append(f"📅 {e['date']} — выходной")
             else:
                 lines.append(f"📅 {e['date']} — {e['start_time'][:5]}–{e['end_time'][:5]}")
-        text = "📌 Текущие исключения:\n\n" + "\n".join(lines)
+        text = f"📌 Исключения за {MONTHS_RU[month]} {year}:\n\n" + "\n".join(lines)
     else:
-        text = "📌 Исключений нет."
+        text = f"📌 Исключений за {MONTHS_RU[month]} {year} нет."
 
     await callback.message.edit_text(text, reply_markup=vacation_keyboard())
     await callback.answer()
+
+
+# ─── ДОБАВЛЕНИЕ / УДАЛЕНИЕ ВЫХОДНЫХ ─────────────────────────────────────────
+
+@router.message(F.text == "🏖 Отпуск / выходные")
+async def admin_vacation_menu(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "📌 Выберите действие:",
+        reply_markup=vacation_keyboard(),
+    )
 
 
 @router.callback_query(F.data == "vacation:add")
@@ -390,33 +420,53 @@ async def admin_vacation_add(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    await state.update_data(selected_vacation_days=[])
+    await state.update_data(selected_vacation_days=[], vac_mode="add")
     await state.set_state(AdminStates.selecting_vacation_days)
     await callback.message.edit_text(
         "🏖 Выберите месяц:",
-        reply_markup=vacation_months_keyboard(),
+        reply_markup=vacation_months_keyboard(mode="add"),
     )
     await callback.answer()
 
+
+@router.callback_query(F.data == "vacation:delete")
+async def admin_vacation_delete(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await state.update_data(selected_vacation_days=[], vac_mode="delete")
+    await state.set_state(AdminStates.selecting_vacation_days)
+    await callback.message.edit_text(
+        "🗑 Выберите месяц для удаления выходных:",
+        reply_markup=vacation_months_keyboard(mode="delete"),
+    )
+    await callback.answer()
+
+
 @router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_month:"))
 async def vacation_month_chosen(callback: CallbackQuery, state: FSMContext):
-    _, year, month = callback.data.split(":")
-    year, month = int(year), int(month)
+    parts = callback.data.split(":")
+    year, month, mode = int(parts[1]), int(parts[2]), parts[3]
 
     data = await state.get_data()
     selected = set(data.get("selected_vacation_days", []))
 
-    await state.update_data(vac_year=year, vac_month=month)
+    await state.update_data(vac_year=year, vac_month=month, vac_mode=mode)
+
+    title = "🗑 Выберите дни для удаления:" if mode == "delete" else "🏖 Выберите дни (можно несколько):"
     await callback.message.edit_text(
-        "🏖 Выберите дни отпуска (можно несколько):",
-        reply_markup=vacation_days_keyboard(year, month, selected),
+        f"{title}\nВыбрано: {len(selected)} дн.",
+        reply_markup=vacation_days_keyboard(year, month, selected, mode),
     )
     await callback.answer()
 
 
 @router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_day:"))
 async def vacation_day_toggle(callback: CallbackQuery, state: FSMContext):
-    date_str = callback.data.split(":", 1)[1]
+    parts = callback.data.split(":")
+    # vac_day:2026-06-15:add  →  parts = ["vac_day", "2026-06-15", "add"]
+    date_str = parts[1]
+    mode = parts[2]
 
     data = await state.get_data()
     selected = set(data.get("selected_vacation_days", []))
@@ -428,27 +478,27 @@ async def vacation_day_toggle(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(selected_vacation_days=list(selected))
 
-    year = data["vac_year"]
+    year  = data["vac_year"]
     month = data["vac_month"]
+    title = "🗑 Выберите дни для удаления:" if mode == "delete" else "🏖 Выберите дни (можно несколько):"
     await callback.message.edit_text(
-        f"🏖 Выберите дни отпуска (можно несколько):\n"
-        f"Выбрано: {len(selected)} дн.",
-        reply_markup=vacation_days_keyboard(year, month, selected),
+        f"{title}\nВыбрано: {len(selected)} дн.",
+        reply_markup=vacation_days_keyboard(year, month, selected, mode),
     )
     await callback.answer()
 
 
-@router.callback_query(AdminStates.selecting_vacation_days, F.data == "vac_back_months")
+@router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_back_months:"))
 async def vacation_back_to_months(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text(
-        "🏖 Выберите месяц:",
-        reply_markup=vacation_months_keyboard(),
-    )
+    mode = callback.data.split(":")[1]
+    title = "🗑 Выберите месяц для удаления выходных:" if mode == "delete" else "🏖 Выберите месяц:"
+    await callback.message.edit_text(title, reply_markup=vacation_months_keyboard(mode=mode))
     await callback.answer()
 
 
-@router.callback_query(AdminStates.selecting_vacation_days, F.data == "vac_done")
+@router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_done:"))
 async def vacation_done(callback: CallbackQuery, state: FSMContext):
+    mode = callback.data.split(":")[1]
     data = await state.get_data()
     selected = data.get("selected_vacation_days", [])
 
@@ -456,14 +506,20 @@ async def vacation_done(callback: CallbackQuery, state: FSMContext):
         await callback.answer("⚠️ Не выбрано ни одного дня.", show_alert=True)
         return
 
-    add_days_off(selected)
-
     dates_sorted = sorted(selected)
+
+    if mode == "delete":
+        delete_days_off(selected)
+        text = f"✅ Удалено выходных дней: {len(dates_sorted)}"
+    else:
+        add_days_off(selected)
+        text = (
+            f"✅ Добавлено выходных дней: {len(dates_sorted)}\n"
+            f"С {dates_sorted[0]} по {dates_sorted[-1]}"
+        )
+
     await state.clear()
-    await callback.message.edit_text(
-        f"✅ Добавлено выходных дней: {len(dates_sorted)}\n\n"
-        f"С {dates_sorted[0]} по {dates_sorted[-1]}"
-    )
+    await callback.message.edit_text(text)
     await callback.message.answer("⚙️ Расписание:", reply_markup=schedule_menu_keyboard())
     await callback.answer()
 
@@ -473,6 +529,10 @@ async def vacation_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("⚙️ Расписание:", reply_markup=schedule_menu_keyboard())
     await callback.answer()
+
+
+# ─── ИСКЛЮЧЕНИЕ — ДОБАВИТЬ РАБОЧИЙ ДЕНЬ ──────────────────────────────────────
+# (отдельный текстовый ввод для нестандартных рабочих часов)
 
 @router.message(AdminStates.waiting_exc_date)
 async def admin_exc_date(message: Message, state: FSMContext):
@@ -496,7 +556,10 @@ async def admin_exc_type(message: Message, state: FSMContext):
         data = await state.get_data()
         add_exception(date.fromisoformat(data["exc_date"]), is_day_off=True)
         await state.clear()
-        await message.answer(f"✅ {data['exc_date']} добавлен как выходной.")
+        await message.answer(
+            f"✅ {data['exc_date']} добавлен как выходной.",
+            reply_markup=admin_main_keyboard(),
+        )
     elif text == "рабочий":
         await state.set_state(AdminStates.waiting_exc_start)
         await message.answer("Введите время начала в формате ЧЧ:ММ:")
@@ -530,91 +593,6 @@ async def admin_exc_end(message: Message, state: FSMContext):
     )
     await state.clear()
     await message.answer(
-        f"✅ {data['exc_date']} — рабочий день {data['exc_start']}–{text}"
-    )
-
-
-@router.callback_query(F.data == "vacation:delete")
-async def admin_exc_delete_ask(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    await state.set_state(AdminStates.waiting_exc_delete)
-    await callback.message.answer(
-        "Введите дату исключения для удаления (ГГГГ-ММ-ДД):"
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.waiting_exc_delete)
-async def admin_exc_delete(message: Message, state: FSMContext):
-    try:
-        d = date.fromisoformat(message.text.strip())
-    except ValueError:
-        await message.answer("⚠️ Неверный формат. Введите ГГГГ-ММ-ДД:")
-        return
-    delete_exception(d)
-    await state.clear()
-    await message.answer(f"✅ Исключение {d.isoformat()} удалено.")
-
-
-# ─── ОТПУСК ──────────────────────────────────────────────────────────────────
-
-@router.message(F.text == "🏖 Отпуск / выходные")
-async def admin_vacation(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        return
-    await state.set_state(AdminStates.waiting_vac_start)
-    await message.answer(
-        "Введите дату начала отпуска (ГГГГ-ММ-ДД):",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
-@router.message(AdminStates.waiting_vac_start)
-async def admin_vac_start(message: Message, state: FSMContext):
-    try:
-        d = date.fromisoformat(message.text.strip())
-    except ValueError:
-        await message.answer("⚠️ Неверный формат. Введите ГГГГ-ММ-ДД:")
-        return
-    await state.update_data(vac_start=d.isoformat())
-    await state.set_state(AdminStates.waiting_vac_end)
-    await message.answer("Введите дату окончания отпуска (ГГГГ-ММ-ДД):")
-
-
-@router.message(AdminStates.waiting_vac_end)
-async def admin_vac_end(message: Message, state: FSMContext):
-    try:
-        end = date.fromisoformat(message.text.strip())
-    except ValueError:
-        await message.answer("⚠️ Неверный формат. Введите ГГГГ-ММ-ДД:")
-        return
-
-    data = await state.get_data()
-    start = date.fromisoformat(data["vac_start"])
-
-    if end < start:
-        await message.answer("⚠️ Дата окончания не может быть раньше начала.")
-        return
-
-    add_vacation(start, end)
-    days = (end - start).days + 1
-    await state.clear()
-    await message.answer(
-        f"✅ Отпуск добавлен: {start.isoformat()} – {end.isoformat()} ({days} дн.)",
+        f"✅ {data['exc_date']} — рабочий день {data['exc_start']}–{text}",
         reply_markup=admin_main_keyboard(),
     )
-
-
-# ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────────────
-
-def _valid_time(s: str) -> bool:
-    try:
-        parts = s.split(":")
-        assert len(parts) == 2
-        h, m = int(parts[0]), int(parts[1])
-        assert 0 <= h <= 23 and 0 <= m <= 59
-        return True
-    except Exception:
-        return False

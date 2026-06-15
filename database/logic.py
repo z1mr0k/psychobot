@@ -450,7 +450,16 @@ def add_days_off(dates: list[str]) -> None:
                 """,
                 (date_str,),
             )
-            
+
+def delete_days_off(dates: list[str]) -> None:
+    """Удаляет записи из work_exceptions для указанных дат."""
+    with get_connection() as conn:
+        for date_str in dates:
+            conn.execute(
+                "DELETE FROM work_exceptions WHERE date = ?",
+                (date_str,),
+            )
+           
 def get_vacations() -> list:
     with get_connection() as conn:
         return conn.execute(
