@@ -91,13 +91,9 @@ def vacation_keyboard() -> InlineKeyboardMarkup:
 
 
 def vacation_months_keyboard(mode: str = "add") -> InlineKeyboardMarkup:
-    """
-    mode = 'add'    — добавление выходных
-    mode = 'delete' — удаление выходных
-    """
     today = date.today()
     builder = InlineKeyboardBuilder()
-    for i in range(3):
+    for i in range(4):  # было 3
         month = today.month + i
         year  = today.year + (month - 1) // 12
         month = ((month - 1) % 12) + 1
@@ -115,11 +111,14 @@ def vacation_days_keyboard(
     month: int,
     selected: set[str],
     mode: str = "add",
+    existing_days_off: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
     """
-    mode = 'add'    — отмечаем дни ✅, жмём Готово → добавляем
-    mode = 'delete' — отмечаем дни 🗑, жмём Готово → удаляем
+    existing_days_off — даты уже помеченные как выходные (показываем серым 🔴).
     """
+    if existing_days_off is None:
+        existing_days_off = set()
+
     builder = InlineKeyboardBuilder()
 
     for day_name in DAYS_RU:
@@ -135,30 +134,95 @@ def vacation_days_keyboard(
         if d < today:
             builder.button(text="·", callback_data="cal_ignore")
             continue
-        if d.isoformat() in selected:
-            mark = "🗑" if mode == "delete" else "✅"
-            builder.button(
-                text=f"{mark}{day}",
-                callback_data=f"vac_day:{d.isoformat()}:{mode}",
-            )
-        else:
-            builder.button(
-                text=str(day),
-                callback_data=f"vac_day:{d.isoformat()}:{mode}",
-            )
 
+        iso = d.isoformat()
+        if iso in selected:
+            mark = "🗑" if mode == "delete" else "✅"
+            builder.button(text=f"{mark}{day}", callback_data=f"vac_day:{iso}:{mode}")
+        elif iso in existing_days_off and mode == "delete":
+            # день уже выходной, но ещё не выбран для удаления
+            builder.button(text=f"🔴{day}", callback_data=f"vac_day:{iso}:{mode}")
+        else:
+            builder.button(text=str(day), callback_data=f"vac_day:{iso}:{mode}")
+
+    done_text = "🗑 Удалить выбранные" if mode == "delete" else "✅ Готово"
+    builder.button(text=done_text,       callback_data=f"vac_done:{mode}")
+    builder.button(text="🔙 К месяцам", callback_data=f"vac_back_months:{mode}")
+    builder.adjust(7)
+    return builder.as_markup()
     done_text = "🗑 Удалить выбранные" if mode == "delete" else "✅ Готово"
     builder.button(text=done_text,        callback_data=f"vac_done:{mode}")
     builder.button(text="🔙 К месяцам",  callback_data=f"vac_back_months:{mode}")
     builder.adjust(7)
     return builder.as_markup()
 
+@router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_month:"))
+async def vacation_month_chosen(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    year, month, mode = int(parts[1]), int(parts[2]), parts[3]
+
+    data = await state.get_data()
+    selected = set(data.get("selected_vacation_days", []))
+
+    await state.update_data(vac_year=year, vac_month=month, vac_mode=mode)
+
+    # При удалении — показываем какие дни уже выходные
+    existing: set[str] = set()
+    if mode == "delete":
+        from database.logic import get_exceptions
+        all_exc = get_exceptions()
+        existing = {
+            e["date"] for e in all_exc
+            if e["date"].startswith(f"{year}-{month:02d}")
+        }
+
+    title = "🗑 Выберите дни для удаления:" if mode == "delete" else "🏖 Выберите дни (можно несколько):"
+    await callback.message.edit_text(
+        f"{title}\nВыбрано: {len(selected)} дн.",
+        reply_markup=vacation_days_keyboard(year, month, selected, mode, existing),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_day:"))
+async def vacation_day_toggle(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    date_str = parts[1]
+    mode = parts[2]
+
+    data = await state.get_data()
+    selected = set(data.get("selected_vacation_days", []))
+
+    if date_str in selected:
+        selected.discard(date_str)
+    else:
+        selected.add(date_str)
+
+    await state.update_data(selected_vacation_days=list(selected))
+
+    year  = data["vac_year"]
+    month = data["vac_month"]
+
+    existing: set[str] = set()
+    if mode == "delete":
+        from database.logic import get_exceptions
+        all_exc = get_exceptions()
+        existing = {
+            e["date"] for e in all_exc
+            if e["date"].startswith(f"{year}-{month:02d}")
+        }
+
+    title = "🗑 Выберите дни для удаления:" if mode == "delete" else "🏖 Выберите дни (можно несколько):"
+    await callback.message.edit_text(
+        f"{title}\nВыбрано: {len(selected)} дн.",
+        reply_markup=vacation_days_keyboard(year, month, selected, mode, existing),
+    )
+    await callback.answer()
 
 def exceptions_months_keyboard() -> InlineKeyboardMarkup:
-    """Выбор месяца для просмотра исключений — текущий + 2 следующих."""
     today = date.today()
     builder = InlineKeyboardBuilder()
-    for i in range(3):
+    for i in range(4):  # было 3
         month = today.month + i
         year  = today.year + (month - 1) // 12
         month = ((month - 1) % 12) + 1
