@@ -454,15 +454,6 @@ async def vacation_month_chosen(callback: CallbackQuery, state: FSMContext):
     await state.update_data(vac_year=year, vac_month=month, vac_mode=mode)
 
     existing: set[str] = set()
-if mode == "delete":
-    from database.logic import get_exceptions
-    all_exc = get_exceptions()
-    existing = {
-        e["date"] for e in all_exc
-        if e["date"].startswith(f"{year}-{month:02d}")
-    }
-
-existing: set[str] = set()
     if mode == "delete":
         from database.logic import get_exceptions
         all_exc = get_exceptions()
@@ -470,6 +461,7 @@ existing: set[str] = set()
             e["date"] for e in all_exc
             if e["date"].startswith(f"{year}-{month:02d}")
         }
+
     title = "🗑 Выберите дни для удаления:" if mode == "delete" else "🏖 Выберите дни (можно несколько):"
     await callback.message.edit_text(
         f"{title}\nВыбрано: {len(selected)} дн.",
@@ -481,7 +473,6 @@ existing: set[str] = set()
 @router.callback_query(AdminStates.selecting_vacation_days, F.data.startswith("vac_day:"))
 async def vacation_day_toggle(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split(":")
-    # vac_day:2026-06-15:add  →  parts = ["vac_day", "2026-06-15", "add"]
     date_str = parts[1]
     mode = parts[2]
 
@@ -497,7 +488,8 @@ async def vacation_day_toggle(callback: CallbackQuery, state: FSMContext):
 
     year  = data["vac_year"]
     month = data["vac_month"]
-   existing: set[str] = set()
+
+    existing: set[str] = set()
     if mode == "delete":
         from database.logic import get_exceptions
         all_exc = get_exceptions()
@@ -505,6 +497,7 @@ async def vacation_day_toggle(callback: CallbackQuery, state: FSMContext):
             e["date"] for e in all_exc
             if e["date"].startswith(f"{year}-{month:02d}")
         }
+
     title = "🗑 Выберите дни для удаления:" if mode == "delete" else "🏖 Выберите дни (можно несколько):"
     await callback.message.edit_text(
         f"{title}\nВыбрано: {len(selected)} дн.",
