@@ -346,7 +346,7 @@ def generate_available_slots(d: date) -> list[time]:
 
 # ─── available dates ──────────────────────────────────────────────────────────
 
-SCHEDULE_HORIZON_MONTHS = 4  # было 3
+SCHEDULE_HORIZON_MONTHS = 3  # было 3
 
 def get_available_dates(from_date: Optional[date] = None) -> list[date]:
     start = from_date or date.today()
