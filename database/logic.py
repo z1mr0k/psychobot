@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import calendar
 import sqlite3
-from datetime import date, time, datetime, timedelta
+from datetime import date, time, datetime, timedelta, timezone
 from typing import Optional
 
 from database.db import get_connection
@@ -188,7 +188,8 @@ def get_bookings_pending_reminder(delta: timedelta, field: str) -> list[sqlite3.
     if field not in ALLOWED_FIELDS:
         raise ValueError(f"Недопустимое поле: {field}")
 
-    now    = datetime.now()
+    MSK = timezone(timedelta(hours=3))
+    now    = datetime.now(MSK).replace(tzinfo=None)
     target = now + delta
     window = timedelta(minutes=1)
 
