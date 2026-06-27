@@ -306,7 +306,9 @@ def generate_available_slots(d: date) -> list[time]:
     day_end   = _to_dt(d, work_end)
 
     if d == date.today():
-        now = datetime.now()
+        from datetime import timezone, timedelta
+            MSK = timezone(timedelta(hours=3))
+            now = datetime.now(MSK).replace(tzinfo=None)
         if day_start < now:
             day_start = now + timedelta(minutes=30)
 
