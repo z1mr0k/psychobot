@@ -304,12 +304,14 @@ def generate_available_slots(d: date) -> list[time]:
 
     work_start, work_end = hours
     day_start = _to_dt(d, work_start)
-    day_end   = _to_dt(d, work_end)
+    day_end = _to_dt(d, work_end)
 
     if d == date.today():
         from datetime import timezone, timedelta
-            MSK = timezone(timedelta(hours=3))
-            now = datetime.now(MSK).replace(tzinfo=None)
+
+        MSK = timezone(timedelta(hours=3))
+        now = datetime.now(MSK).replace(tzinfo=None)
+
         if day_start < now:
             day_start = now + timedelta(minutes=30)
 
@@ -338,6 +340,7 @@ def generate_available_slots(d: date) -> list[time]:
         free_windows.append((cursor, day_end))
 
     available: list[time] = []
+
     for window_start, window_end in free_windows:
         slot = window_start
         while slot + SESSION_DURATION <= window_end:
